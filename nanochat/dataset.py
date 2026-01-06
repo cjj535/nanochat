@@ -20,6 +20,7 @@ from nanochat.common import get_base_dir
 # The specifics of the current pretraining dataset
 
 # The URL on the internet where the data is hosted and downloaded from on demand
+# 从网站上下数据集
 BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
 MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
@@ -30,6 +31,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
 
+# 返回一个所有下载的数据文件的列表
 def list_parquet_files(data_dir=None):
     """ Looks into a data dir and returns full paths to all parquet files. """
     data_dir = DATA_DIR if data_dir is None else data_dir
@@ -47,12 +49,12 @@ def parquets_iter_batched(split, start=0, step=1):
     - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
-    parquet_paths = list_parquet_files()
-    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
+    parquet_paths = list_parquet_files()                                                # 获取文件列表
+    parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]      # 留下最后一个文件作为eval
     for filepath in parquet_paths:
         pf = pq.ParquetFile(filepath)
         for rg_idx in range(start, pf.num_row_groups, step):
-            rg = pf.read_row_group(rg_idx)
+            rg = pf.read_row_group(rg_idx)              # parquet文件用row group组织内容，可以批量读写
             texts = rg.column('text').to_pylist()
             yield texts
 
@@ -72,6 +74,7 @@ def download_single_file(index):
     print(f"Downloading {filename}...")
 
     # Download with retries
+    # 尝试下载单个文件5次
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:

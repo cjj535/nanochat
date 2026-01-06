@@ -80,9 +80,9 @@ token_bytes = []
 for token_id in range(vocab_size):
     token_str = token_strings[token_id] # the Python string representation of this token
     if token_str in special_set:
-        token_bytes.append(0) # special characters are not counted
+        token_bytes.append(0) # special characters are not counted                                  # 特殊token不需编码，也不计入loss
     else:
-        id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
+        id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token         # 一个token所需的字节数，由所对应的str决定，str用utf-8编码
         token_bytes.append(id_bytes)
 token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
 token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")

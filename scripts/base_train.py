@@ -12,7 +12,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"           # 开启虚拟内存节省内存
 import argparse
 import time
 from contextlib import nullcontext
@@ -70,24 +70,25 @@ user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 
 # Compute init
-device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+device_type = autodetect_device_type() if args.device_type == "" else args.device_type          # 检测设备
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)               # 初始化分布式环境
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()    # 使用torch的自动混合精度
+synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None                 # cuda的host device同步函数
+get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0        # 获取torch内存池allocated最大峰值
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
-vocab_size = tokenizer.get_vocab_size()
+tokenizer = get_tokenizer()                         # 获取tokenizer
+token_bytes = get_token_bytes(device=device)        # 获取tokenizer中每个token编码所需字节数
+vocab_size = tokenizer.get_vocab_size()             # 获取词表大小
 print0(f"Vocab size: {vocab_size:,}")
 
 # Model kwargs are derived from the desired depth of the model
+# 设置模型基本参数，层数、注意力头数、隐藏维度、kv头数
 num_layers = args.depth
 model_dim = args.depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 as model size increases)
 def find_num_heads(model_dim, target_head_dim=128):
@@ -110,7 +111,7 @@ print0(f"num_kv_heads: {num_kv_heads}")
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
 assert args.total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
+grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd         # 推导梯度累积次数
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
@@ -119,6 +120,7 @@ print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation ste
 # Initialize the Model
 
 # Create a new model with random weights
+# 在device上申请一片空间存放权重并随机初始化
 model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
@@ -132,20 +134,21 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
-if resuming:
+if resuming:            # 是否断点续训
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
-num_params = sum(p.numel() for p in model.parameters())
+model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe      # 编译成图，输入shape不变可设为false
+num_params = sum(p.numel() for p in model.parameters())             # 统计参数量
 print0(f"Number of parameters: {num_params:,}")
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = model.estimate_flops()                        # 统计训练时单token所需计算量
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
+# 推算迭代次数与总训练token数，经验公式是 总训练token数 / 参数量 = 20
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if args.num_iterations > 0:
     num_iterations = args.num_iterations
@@ -169,15 +172,16 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
 optimizers = model.setup_optimizers(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=args.weight_decay)
-adamw_optimizer, muon_optimizer = optimizers
+adamw_optimizer, muon_optimizer = optimizers        # 分别初始化两个优化器
 
-if resuming:
+if resuming:                    # 如果断点续训，加载最后一次优化器状态
     for opt, dat in zip(optimizers, optimizer_data):
         opt.load_state_dict(dat)
     del optimizer_data # free up the memory
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
+# 加载数据集，如果是断点续训，大约估计最后一次数据读取位置，接着读取
 tokens_dir = os.path.join(base_dir, "tokenized_data")
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state(args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
@@ -188,6 +192,7 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # Set up hyperparameter schedulers
 
 # Learning rate scheduler
+# lr，warmup方式更新lr
 def get_lr_multiplier(it):
     warmup_iters = round(args.warmup_ratio * num_iterations)
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
@@ -226,9 +231,10 @@ else:
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * args.total_batch_size * step
+    flops_so_far = num_flops_per_token * args.total_batch_size * step           # 包含多卡的计算量
 
     # once in a while: evaluate the val bpb (all ranks participate)
+    # bpb方式评估loss
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
@@ -248,6 +254,7 @@ while True:
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
+    # 评估模型的基础能力，如文本预测、上下文一致性、选择判断
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
@@ -264,6 +271,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
+    # 测试实际样例效果
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
@@ -276,6 +284,7 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        # 使用engine完成推理过程
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with autocast_ctx:
@@ -284,6 +293,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
+    # 保存checkpoint
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
@@ -314,32 +324,32 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
-    synchronize()
-    t0 = time.time()
+    synchronize()               # step同步
+    t0 = time.time()            # 统计step耗时
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
+        with autocast_ctx:                  # 混合精度训练
             loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # gradient clipping
-    grad_clip_enabled = args.grad_clip > 0.0
+    grad_clip_enabled = args.grad_clip > 0.0            # 梯度裁剪
     if grad_clip_enabled:
         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), args.grad_clip)
-        grad_norm = grad_norm_tensor.item() # GPU tensor -> CPU float (note: cpu-gpu sync point)
+        grad_norm = grad_norm_tensor.item() # GPU tensor -> CPU float (note: cpu-gpu sync point)        # 获取norm后的grad，同时也是host device同步点
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
+            group["lr"] = group["initial_lr"] * lrm         # 根据lr schedule更新lr
     muon_momentum = get_muon_momentum(step)
     for group in muon_optimizer.param_groups:
         group["momentum"] = muon_momentum
     for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-    synchronize()
+        opt.step()                  # 逐个完成权重更新
+    model.zero_grad(set_to_none=True)   # 清空梯度
+    synchronize()                   # step同步
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------

@@ -79,7 +79,7 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-mi
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
 pretrain_batch_size = meta.get("device_batch_size", None)
-if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
+if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:        # bs比预训练更大
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
 orig_model = model
 model = torch.compile(model, dynamic=False)
@@ -104,6 +104,7 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
 # Midtraining data mixture and DataLoader
+# 选用特定任务的数据集，进行mid train
 base_dir = get_base_dir()
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
@@ -115,6 +116,7 @@ train_dataset = TaskMixture([
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]) # total: 460K + 100K + 8K + 200K + 80K = 848K rows
+# 848k条训练数据，训一遍
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios

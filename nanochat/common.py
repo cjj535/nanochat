@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from filelock import FileLock
 
+# 设置logging
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
     # ANSI color codes
@@ -73,6 +74,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     with FileLock(lock_path):
         # Only a single rank can acquire this lock
         # All other ranks block until it is released
+        # 多进程下载文件，只有单个进程可以下载，其余进程则需要等待下载
 
         # Recheck after acquiring lock
         if os.path.exists(file_path):
@@ -94,6 +96,8 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
 
     return file_path
 
+
+# 0卡打印信息
 def print0(s="",**kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
@@ -113,6 +117,7 @@ def print_banner():
     """
     print0(banner)
 
+# 通过是否设置了环境变量WORLD_SIZE等，判断是否是通过torchrun拉起的进程
 def is_ddp_requested() -> bool:
     """
     True if launched by torchrun (env present), even before init.
@@ -120,6 +125,7 @@ def is_ddp_requested() -> bool:
     """
     return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
 
+# 检查torch的分布式功能是否可用，以及是否初始化分布式环境
 def is_ddp_initialized() -> bool:
     """
     True if torch.distributed is available and the process group is initialized.
@@ -127,6 +133,7 @@ def is_ddp_initialized() -> bool:
     """
     return dist.is_available() and dist.is_initialized()
 
+# 获取分布式环境信息
 def get_dist_info():
     if is_ddp_requested():
         # We rely on torchrun's env to decide if we SHOULD init.
@@ -139,6 +146,7 @@ def get_dist_info():
     else:
         return False, 0, 0, 1
 
+# 获取device信息
 def autodetect_device_type():
     # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
     if torch.cuda.is_available():
@@ -160,6 +168,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
 
     # Reproducibility
+    # 固化随机数和使用确定性计算，确保实验可复现
     # Note that we set the global seeds here, but most of the code uses explicit rng objects.
     # The only place where global rng might be used is nn.Module initialization of the model weights.
     torch.manual_seed(42)
@@ -169,11 +178,14 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     # torch.use_deterministic_algorithms(True)
 
     # Precision
+    # TF32 只用于计算过程，输入/输出仍然是 FP32。它是一种“计算时自动截断”的加速模式。
+    # TF32保留和fp32一样的指数位数8，但是尾数从23位变成10位
     if device_type == "cuda":
         torch.backends.cuda.matmul.fp32_precision = "tf32" # uses tf32 instead of fp32 for matmuls
 
     # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
     is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    # 初始化cuda分布式环境
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
@@ -187,11 +199,13 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
 
+# 清理分布式环境
 def compute_cleanup():
     """Companion function to compute_init, to clean things up before script exit"""
     if is_ddp_initialized():
         dist.destroy_process_group()
 
+# 实际并没有使用真正的wandb
 class DummyWandb:
     """Useful if we wish to not use wandb but have all the same signatures"""
     def __init__(self):

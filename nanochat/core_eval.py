@@ -23,13 +23,13 @@ def render_prompts_mc(item, continuation_delimiter, fewshot_examples=None):
 {% endfor -%}
 {{ item.query }}{{ continuation_delimiter }}{{ choice }}""".strip()
     template = Template(template_str)
-    fewshot_examples = fewshot_examples or []
+    fewshot_examples = fewshot_examples or []           # fewshot是采集了其他同类样本，目的是让gpt先学习类似的题目怎么解，然后来判断现在的题目中哪个选项更好
     context = {
         'fewshot_examples': fewshot_examples,
         'continuation_delimiter': continuation_delimiter,
         'item': item
     }
-    prompts = [template.render(choice=choice, **context) for choice in item['choices']]
+    prompts = [template.render(choice=choice, **context) for choice in item['choices']]     # 对现在的题目给出的所有选项，分别组成prompt，交给gpt去判断哪个更好
     return prompts
 
 
@@ -173,6 +173,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     continuation_delimiter = task_meta['continuation_delimiter']
 
     # Sample few-shot examples (excluding current item)
+    # 随机抽选样本测试
     fewshot_examples = []
     if num_fewshot > 0:
         rng = random.Random(1234 + idx)
@@ -213,7 +214,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
     # Stack up all the sequences into a batch
-    pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
+    pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok    使用bos做为padding
     input_ids = stack_sequences(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 
@@ -241,6 +242,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
+# 用于base train的时候，评估模型在各方面的性能，包括上下文一致性、多项选择、文本预测
 def evaluate_task(model, tokenizer, data, device, task_meta):
     """
     This function is responsible for evaluating one task across many examples.

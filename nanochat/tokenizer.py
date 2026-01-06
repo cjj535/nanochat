@@ -72,6 +72,7 @@ class HuggingFaceTokenizer:
         # very small models and smaller vocab sizes, because it is a little bit wasteful in the token space.
         # (but I haven't validated this! TODO)
         gpt4_split_regex = Regex(SPLIT_PATTERN) # huggingface demands that you wrap it in Regex!!
+        # 对文本进行最小单元分割，最小单元作为基本token，后续使用bpe组合高频对形成新的token
         tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
             pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False),
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
@@ -93,7 +94,7 @@ class HuggingFaceTokenizer:
         return cls(tokenizer)
 
     def get_vocab_size(self):
-        return self.tokenizer.get_vocab_size()
+        return self.tokenizer.get_vocab_size()      # 获取tokenizer的此表大小
 
     def get_special_tokens(self):
         special_tokens_map = self.tokenizer.get_added_tokens_decoder()
@@ -101,7 +102,7 @@ class HuggingFaceTokenizer:
         return special_tokens
 
     def id_to_token(self, id):
-        return self.tokenizer.id_to_token(id)
+        return self.tokenizer.id_to_token(id)       # 数值转字符
 
     def _encode_one(self, text, prepend=None, append=None):
         # encode a single string
@@ -109,7 +110,7 @@ class HuggingFaceTokenizer:
         assert isinstance(text, str)
         ids = []
         if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)      # 特殊字符转token
             ids.append(prepend_id)
         ids.extend(self.tokenizer.encode(text, add_special_tokens=False).ids)
         if append is not None:
@@ -121,7 +122,7 @@ class HuggingFaceTokenizer:
         # encode a single special token via exact match
         return self.tokenizer.token_to_id(text)
 
-    def get_bos_token_id(self):
+    def get_bos_token_id(self):         # 设置bos的token值
         # Different HuggingFace models use different BOS tokens and there is little consistency
         # 1) attempt to find a <|bos|> token
         bos = self.encode_special("<|bos|>")
@@ -153,6 +154,7 @@ class HuggingFaceTokenizer:
         self.tokenizer.save(tokenizer_path)
         print(f"Saved tokenizer to {tokenizer_path}")
 
+# 前面是使用的huggingface的tokenizer，下面是基于rustbpe和tiktoken的tokenizer
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
 import pickle
@@ -272,13 +274,14 @@ class RustBPETokenizer:
         # ids, masks that we will return and a helper function to help build them up.
         ids, mask = [], []
         def add_tokens(token_ids, mask_val):
-            if isinstance(token_ids, int):
+            if isinstance(token_ids, int):  # 转列表
                 token_ids = [token_ids]
             ids.extend(token_ids)
-            mask.extend([mask_val] * len(token_ids))
+            mask.extend([mask_val] * len(token_ids))        # 设置token的掩码，后续训练用于判断哪些token可用做loss计算
 
         # sometimes the first message is a system message...
         # => just merge it with the second (user) message
+        # 将system信息和user信息合并
         if conversation["messages"][0]["role"] == "system":
             # some conversation surgery is necessary here for now...
             conversation = copy.deepcopy(conversation) # avoid mutating the original
@@ -291,6 +294,7 @@ class RustBPETokenizer:
         assert len(messages) >= 1, f"Conversation has less than 1 message: {messages}"
 
         # fetch all the special tokens we need
+        # 获取所有特殊字符的token
         bos = self.get_bos_token_id()
         user_start, user_end = self.encode_special("<|user_start|>"), self.encode_special("<|user_end|>")
         assistant_start, assistant_end = self.encode_special("<|assistant_start|>"), self.encode_special("<|assistant_end|>")
@@ -320,7 +324,7 @@ class RustBPETokenizer:
                     # simple string => simply add the tokens
                     value_ids = self.encode(content)
                     add_tokens(value_ids, 1)
-                elif isinstance(content, list):
+                elif isinstance(content, list):     # gpt回答是一个list，那么分部分编码
                     for part in content:
                         value_ids = self.encode(part["text"])
                         if part["type"] == "text":
@@ -334,6 +338,7 @@ class RustBPETokenizer:
                         elif part["type"] == "python_output":
                             # python output => add the tokens inside <|output_start|> and <|output_end|>
                             # none of these tokens are supervised because the tokens come from Python at test time
+                            # python程序的输出，不可以作为监督训练的数据
                             add_tokens(output_start, 0)
                             add_tokens(value_ids, 0)
                             add_tokens(output_end, 0)
@@ -344,12 +349,14 @@ class RustBPETokenizer:
                 add_tokens(assistant_end, 1)
 
         # truncate to max_tokens tokens MAX (helps prevent OOMs)
+        # 内容截断
         ids = ids[:max_tokens]
         mask = mask[:max_tokens]
         return ids, mask
 
     def visualize_tokenization(self, ids, mask, with_token_id=False):
         """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
+        # 可视化展示str及其对应token
         RED = '\033[91m'
         GREEN = '\033[92m'
         RESET = '\033[0m'
@@ -357,7 +364,7 @@ class RustBPETokenizer:
         tokens = []
         for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
             token_str = self.decode([token_id])
-            color = GREEN if mask_val == 1 else RED
+            color = GREEN if mask_val == 1 else RED     # 显示掩码信息
             tokens.append(f"{color}{token_str}{RESET}")
             if with_token_id:
                 tokens.append(f"{GRAY}({token_id}){RESET}")
@@ -369,16 +376,18 @@ class RustBPETokenizer:
         render the conversation priming the Assistant for a completion.
         Unlike the Chat SFT case, we don't need to return the mask.
         """
+        # 专门用于强化学习，不再返回掩码
         # We have some surgery to do: we need to pop the last message (of the Assistant)
         conversation = copy.deepcopy(conversation) # avoid mutating the original
         messages = conversation["messages"]
         assert messages[-1]["role"] == "assistant", "Last message must be from the Assistant"
-        messages.pop() # remove the last message (of the Assistant) inplace
+        messages.pop() # remove the last message (of the Assistant) inplace         # 删掉最后一次gpt的回答内容
 
         # Now tokenize the conversation
         ids, mask = self.render_conversation(conversation)
 
         # Finally, to prime the Assistant for a completion, append the Assistant start token
+        # 让gpt重新回答
         assistant_start = self.encode_special("<|assistant_start|>")
         ids.append(assistant_start)
         return ids
@@ -391,9 +400,11 @@ def get_tokenizer():
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
     # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
+    # 使用rustbpe而不是huggingface
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):
+    # 获取一个字典，内容是每个token所占用的字节数
     import torch
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()

@@ -12,6 +12,11 @@ import platform
 import psutil
 import torch
 
+# --------------------------------------------------------------------------------------------------------------------------------
+# 打印系统环境信息
+# 整理结果报告并打印
+# 日志信息
+
 def run_command(cmd):
     """Run a shell command and return output, or None if it fails."""
     try:

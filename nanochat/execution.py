@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 # -----------------------------------------------------------------------------
+# 执行python代码，尝试给出python代码结果
+# 为了保证代码运行时安全，需要在运行代码前关闭一些系统权限
 
 @dataclass
 class ExecutionResult:

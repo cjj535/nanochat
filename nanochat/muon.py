@@ -18,8 +18,8 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
-    a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    a, b, c = (3.4445, -4.7750,  2.0315)    # 一串经验值，未见具体推导过程
+    X = G.bfloat16()                        # bf16格式进行计算
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -35,6 +35,11 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
+"""
+Muon优化器，专门为矩阵更新设计的优化器，采用SGD更新方法，只保存一个优化器状态，即动量，且这里采用Nesterov-style momentum
+对于二维矩阵，muon优化器在更新梯度时，将梯度矩阵进行奇异值分解SVD，分解过程具体由newton-schulz5估算
+实测可减少迭代次数，且内存使用比adam更优
+"""
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -62,7 +67,7 @@ class Muon(torch.optim.Optimizer):
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
-            group = dict(params=[p for p in params if p.numel() == size])
+            group = dict(params=[p for p in params if p.numel() == size])       # 按numel值分group存放
             param_groups.append(group)
         super().__init__(param_groups, defaults)
 
@@ -78,9 +83,9 @@ class Muon(torch.optim.Optimizer):
                     state["momentum_buffer"] = torch.zeros_like(g)
                 buf: Tensor = state["momentum_buffer"]
                 buf.lerp_(g, 1 - group["momentum"])
-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)
+                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf       # g_new = beta * m + (1 - beta) * g, newtreov: g_new = beta * g_new + (1 - beta) * g，提前根据动量方向多走一步
+                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])             # SVD更新梯度，使得每个正交的方向上都进行更新
+                p.add_(g, alpha=-group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5)    # 没有权重衰减
 
 
 class DistMuon(torch.optim.Optimizer):
@@ -108,7 +113,7 @@ class DistMuon(torch.optim.Optimizer):
                  nesterov: bool = True, ns_steps: int = 5):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params = list(params)
-        assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
+        assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"      # 只对二维矩阵权重有效
         rank = dist.get_rank()
         # Group all parameters by their shape
         shapes = sorted({p.shape for p in params}) # sort to ensure consistent / deterministic ordering
@@ -137,7 +142,7 @@ class DistMuon(torch.optim.Optimizer):
             params = group["params"]
             zero_buffer = group["zero_buffer"]
             # Go through params in groups of world_size.
-            for base_i in range(0, len(params), world_size):
+            for base_i in range(0, len(params), world_size):        # 为避免矩阵运算需要分卡完成，将单个矩阵放在单卡上，不对tensor做切分，因此网络层数最好能整除卡数，可以保证切分均匀
                 # The compute owner of each param is rank i % world_size
                 owner_idx = base_i + rank
                 # each rank stacks up its chunk of world_size params into a list

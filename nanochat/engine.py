@@ -23,6 +23,7 @@ from contextlib import nullcontext
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
+# 专门用于统计字符
 @contextmanager
 def timeout(duration, formula):
     def timeout_handler(signum, frame):
@@ -104,6 +105,7 @@ class KVCache:
         This is used when we do batch 1 prefill and then want to generate
         multiple samples in parallel from there.
         """
+        # 拷贝kv cache
         # 1) validate the shapes
         assert self.kv_cache is None, "Cannot prefill a non-empty KV cache"
         assert other.kv_cache is not None, "Cannot prefill with a None KV cache"
@@ -135,20 +137,21 @@ class KVCache:
     def insert_kv(self, layer_idx, k, v):
         # Lazy initialize the cache here because we need to know the dtype/device
         if self.kv_cache is None:
-            self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
+            self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)      # 用时才申请，长度是固定数值
         # Insert new keys/values to the cache and return the full cache so far
         B, H, T_add, D = k.size()
         t0, t1 = self.pos, self.pos + T_add
         # Dynamically grow the cache if needed
-        if t1 > self.kv_cache.size(4):
+        if t1 > self.kv_cache.size(4):              # 如果超过cache最大长度
             t_needed = t1 + 1024 # as much as we need plus buffer of 1024
             t_needed = (t_needed + 1023) & ~1023 # then round up to the nearest multiple of 1024
             additional_shape = list(self.kv_cache.shape)
             additional_shape[4] = t_needed - self.kv_cache.size(4)
             additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
-            self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()
+            self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=4).contiguous()        # 扩充cache大小
             self.kv_shape = self.kv_cache.shape
         # Insert k, v into the cache
+        # 插入k，v
         self.kv_cache[layer_idx, 0, :, :, t0:t1, :] = k
         self.kv_cache[layer_idx, 1, :, :, t0:t1, :] = v
         # Return the full cached keys/values up to current position (as a view)
@@ -157,10 +160,11 @@ class KVCache:
         # Increment pos after the last layer of the Transformer processes
         if layer_idx == self.kv_cache.size(0) - 1:
             self.pos = t1
-        return key_view, value_view
+        return key_view, value_view             # 返回插入kv之后的kv cache
 
 
 # -----------------------------------------------------------------------------
+# 结合temperature和topk策略的采样
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
@@ -205,6 +209,7 @@ class Engine:
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
+        # 编码特殊字符
         get_special = lambda s: self.tokenizer.encode_special(s)
         python_start = get_special("<|python_start|>")
         python_end = get_special("<|python_end|>")
@@ -222,7 +227,7 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)         # 前向过程填充kv cache
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
@@ -236,20 +241,21 @@ class Engine:
         del kv_cache_prefill # no need to keep this memory around
 
         # 3) Initialize states for each sample
+        # 对每个sample记录当前状态
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
         # 4) Main generation loop
         num_generated = 0
         while True:
             # Stop condition: we've reached max tokens
-            if max_tokens is not None and num_generated >= max_tokens:
+            if max_tokens is not None and num_generated >= max_tokens:      # 最大长度截断
                 break
             # Stop condition: all rows are completed
-            if all(state.completed for state in row_states):
+            if all(state.completed for state in row_states):                # 所有样例完成
                 break
 
             # Sample the next token for each row
-            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)     # 单次采样
             sampled_tokens = next_ids[:, 0].tolist()
 
             # Process each row: choose the next token, update state, optional tool use
@@ -259,7 +265,7 @@ class Engine:
                 # Select the next token in this row
                 is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
                 token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
-                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]      # python程序运行结果代替生成token
                 token_column.append(next_token)
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
@@ -290,7 +296,7 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)     # 只输入最后一个token，前面的信息都已经存在kv cache
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

@@ -9,7 +9,7 @@ from nanochat.tokenizer import get_tokenizer
 
 def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads=4, tokenizer_batch_size=128, device="cuda", resume_state_dict=None):
     """
-    Stream pretraining text from parquet files, tokenize, yield training batches.
+    Stream pretraining text from parquet files, tokenize, yield training batches.   # 功能包括读取文件、token化、组织batch
 
     This implementation became a bit more complex because we wish to support approximate resume training.
     Instead of turning this into a Class, we opt to return the state_dict with every batch,
@@ -27,8 +27,8 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
     def document_batches():
         parquet_paths = list_parquet_files()
         assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
-        parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
-        resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0
+        parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]          # 只留下一个文件作为eval
+        resume_pq_idx = resume_state_dict["pq_idx"] if resume_state_dict is not None else 0     # 获取checkpoint文件中记录的最后一次使用的parquet文件编号以及row gropu编号
         resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
         first_pass = True
         pq_idx = resume_pq_idx # we kick off parquet files at the resume index (or by default just 0)
@@ -43,7 +43,7 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
                     base_idx = resume_rg_idx // ddp_world_size # in units of ddp_world_size
                     base_idx += 1 # advance by 1 so that we definitely don't repeat data after resuming
                     rg_idx = base_idx * ddp_world_size + ddp_rank
-                    if rg_idx >= pf.num_row_groups:
+                    if rg_idx >= pf.num_row_groups:     # row group超出文件范围，进入下一个文件读取数据
                         pq_idx += 1
                         continue
                     resume_rg_idx = None # set to None as we only want to do this a single time
@@ -71,19 +71,19 @@ def tokenizing_distributed_data_loader_with_state(B, T, split, tokenizer_threads
         # Accumulate enough tokens for one iteration before yielding.
         while len(token_buffer) < needed_tokens:
             doc_batch, (pq_idx, rg_idx) = next(batches)
-            token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+            token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)     # 多线程编码加速
             for tokens in token_lists:
                 token_buffer.extend(tokens)
         # Move tokens from the deque into the scratch buffer
         tokens = [token_buffer.popleft() for _ in range(needed_tokens)]
         # CUDA supports memory pinning for asynchronous transfers between CPU and GPU
-        use_cuda_optimizations = device == "cuda"
+        use_cuda_optimizations = device == "cuda"           # 使用锁页内存传输
         scratch = torch.tensor(tokens, dtype=torch.long, pin_memory=use_cuda_optimizations) # in PyTorch, long=int64
         # Create the inputs/targets as 1D tensors
-        inputs_cpu = scratch[:-1]
-        targets_cpu = scratch[1:]
+        inputs_cpu = scratch[:-1]           # 制作输入，可能混合多个对话，但是对话用bos隔开，所以没关系
+        targets_cpu = scratch[1:]           # 制作输出，输出就是输入token的下一个token
         # Reshape to 2D and move to GPU async
-        inputs = inputs_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
+        inputs = inputs_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)   # 异步传输到gpu
         targets = targets_cpu.view(B, T).to(device=device, non_blocking=use_cuda_optimizations)
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx} # we need this in case we wish to approximately resume training
         yield inputs, targets, state_dict

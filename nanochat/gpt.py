@@ -35,6 +35,7 @@ class GPTConfig:
 
 def norm(x):
     # Purely functional rmsnorm with no learnable params
+    # 不设置可学习参数，仅做归一化
     return F.rms_norm(x, (x.size(-1),))
 
 
@@ -82,12 +83,13 @@ class CausalSelfAttention(nn.Module):
         Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
+        # 通过kv数和head数判断是否开启GQA
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
+        if kv_cache is None or Tq == Tk:            # 训练模式，没有kv cache
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-        elif Tq == 1:
+        elif Tq == 1:           # 推理模式
             # During inference but with a single query in this forward pass:
             # The query has to attend to all the keys/values in the cache
             y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
@@ -114,8 +116,9 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
+        # 可以考虑门控机制
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        x = F.relu(x).square()  # relu(x)^2
         x = self.c_proj(x)
         return x
 
@@ -150,9 +153,10 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
+        # 预留足够的位置编码长度
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)        # 初始化位置编码
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
@@ -206,7 +210,7 @@ class GPT(nn.Module):
         # stride the time steps
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
+        freqs = torch.outer(t, inv_freq)    # 向量外积
         cos, sin = freqs.cos(), freqs.sin()
         cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
@@ -217,9 +221,12 @@ class GPT(nn.Module):
 
     def estimate_flops(self):
         """ Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 """
+        # 对每个token，估算训练过程中所需的FLOPs
         nparams = sum(p.numel() for p in self.parameters())
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
+        # 权重基本来自矩阵，矩阵乘加是2倍，反向需要2倍矩阵乘加，则总共是6 * 参数量
+        # 没有权重参与的计算来源于attn，分别是S=QK^T, O=PV，对应单个token，计算量是 2 * (1+2) * 2 * L * H * T * q
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
@@ -227,30 +234,31 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = list(self.transformer.h.parameters())       # 中间块的权重都是矩阵乘运算
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding and lm_head
+        # 对embedding层和lm head用adamw
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
         adam_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),   # lm head学习率，更低
+            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),   # embedding学习率
         ]
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
-        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)     # 配置adamw优化器
         # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)                 # 为矩阵单独设置优化器和学习率
         MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
         for opt in optimizers:
             for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
+                group["initial_lr"] = group["lr"]                   # 设置初始学习率
         return optimizers
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
@@ -282,7 +290,7 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            return loss         # 直接返回loss，使用chunked loss计算可以降低显存峰值
         else:
             # inference: just return the logits directly
             return logits
@@ -305,15 +313,16 @@ class GPT(nn.Module):
         for _ in range(max_tokens):
             logits = self.forward(ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
+            # 筛选topk个，只从topk中抽取
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits[logits < v[:, [-1]]] = -float('Inf')     # 小于topk最小的，都设为-inf
             if temperature > 0:
-                logits = logits / temperature
+                logits = logits / temperature                   # T大于1，则熵越大，采样越多样，反之，T小于1，越稳定
                 probs = F.softmax(logits, dim=-1)
                 next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
-                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
-            ids = torch.cat((ids, next_ids), dim=1)
+                next_ids = torch.argmax(logits, dim=-1, keepdim=True)       # T=0，则是确定性，选择最大值作为输出
+            ids = torch.cat((ids, next_ids), dim=1)         # 新增token放入到序列中
             token = next_ids.item()
             yield token

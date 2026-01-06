@@ -5,6 +5,12 @@ import math
 import torch
 import torch.distributed as dist
 
+"""
+这个函数 evaluate_bpb 的目的是评估语言模型的性能，使用“每字节比特数”（bits per byte, bpb）作为指标，而不是传统的平均损失（mean loss）
+传统损失（cross-entropy loss）依赖于词表大小（vocab size），不同 tokenizer会导致 loss 不可比。
+bpb 是一个与 tokenization 无关的指标：它衡量的是压缩效率——即每个原始字节需要多少比特来编码。
+这使得你可以公平地比较使用不同 tokenizer 或 vocab size 的模型。
+"""
 @torch.no_grad()
 def evaluate_bpb(model, batches, steps, token_bytes):
     """
@@ -36,30 +42,36 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32
             # slightly more complex code path if some target tokens are ignore_index (e.g. -1)
             # any target token < 0 is to be ignored: do NOT index token_bytes with negatives
+            # 忽略小于0的
             valid = y >= 0
-            y_safe = torch.where(valid, y, torch.zeros_like(y))
+            y_safe = torch.where(valid, y, torch.zeros_like(y))     # 负值改为0
             # map valid targets to their byte length; ignored targets contribute 0 bytes
             num_bytes2d = torch.where(
                 valid,
-                token_bytes[y_safe],
-                torch.zeros_like(y, dtype=token_bytes.dtype)
+                token_bytes[y_safe],                                # token所对应的字节数
+                torch.zeros_like(y, dtype=token_bytes.dtype)        # 负值的字节数设为0
             )
-            total_nats += (loss2d * (num_bytes2d > 0)).sum()
-            total_bytes += num_bytes2d.sum()
+            total_nats += (loss2d * (num_bytes2d > 0)).sum()        # 
+            total_bytes += num_bytes2d.sum()                        # 字节数累计
         else:
             # fast path: no ignored targets, safe to index directly
             num_bytes2d = token_bytes[y]
             total_nats += (loss2d * (num_bytes2d > 0)).sum()
             total_bytes += num_bytes2d.sum()
     # sum reduce across all ranks
+    # 多卡环境下计算和
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if world_size > 1:
         dist.all_reduce(total_nats, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_bytes, op=dist.ReduceOp.SUM)
     # move both to cpu, calculate bpb and return
-    total_nats = total_nats.item()
+    total_nats = total_nats.item()          # cpu上获取数值
     total_bytes = total_bytes.item()
+
+    # 编码除数为0
     if total_bytes == 0:
         return float('inf')
+    
+    # bpb核心公式，类似求加权平均，可以看作每字节的平均loss，可用于跨tokenizer的性能衡量。有的token虽然loss大，但是字节数同样大，平均下来就比较小
     bpb = total_nats / (math.log(2) * total_bytes)
     return bpb

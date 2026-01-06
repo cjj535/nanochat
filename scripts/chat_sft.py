@@ -93,6 +93,7 @@ train_ds = TaskMixture([
     SimpleSpelling(size=300, split="train"), # 300 rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=300, split="train"), # 300 rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]) # 2.3K + 1.1K + 8K + 10K + 1K + 0.3K + 0.3K = 23K rows
+# 23k条微调数据
 val_ds = SmolTalk(split="test") # general conversations, 24K rows (though we don't actually use all of it)
 
 # -----------------------------------------------------------------------------

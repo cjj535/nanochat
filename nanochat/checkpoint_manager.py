@@ -21,18 +21,21 @@ def log0(message):
         logger.info(message)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
-    if rank == 0:
+    if rank == 0:       # 0卡保存即可
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
+        # 保存模型权重
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
         # Save the metadata dict as json
+        # 保存模型超参数
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
+    # 每卡分别保存自己的优化器状态，这个文件对于断点续训非常重要，没有的话loss起点可能会比较低且震荡较大，无法从断点处上升
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
@@ -40,6 +43,7 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
+    # 分别加载权重，metadata，优化器状态
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
@@ -67,6 +71,7 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
+        # 模型权重用bf16保存，如果在cpu上需要转为float
         model_data = {
             k: v.float() if v.dtype == torch.bfloat16 else v
             for k, v in model_data.items()
@@ -75,12 +80,15 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
+    # 使用metadata记录的超参数定义模型
     model_config = GPTConfig(**model_config_kwargs)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
+    # 权重初始化
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # 加载已有权重
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
@@ -88,6 +96,7 @@ def build_model(checkpoint_dir, step, device, phase):
     else:
         model.train()
     # Load the Tokenizer
+    # 加载tokenizer
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"]
@@ -95,6 +104,7 @@ def build_model(checkpoint_dir, step, device, phase):
 
 
 def find_largest_model(checkpoints_dir):
+    # 找最大模型文件，按照depth来判断大小
     # attempt to guess the model tag: take the biggest model available
     model_tags = [f for f in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, f))]
     if not model_tags:
@@ -110,11 +120,13 @@ def find_largest_model(checkpoints_dir):
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
     # 2) if that failed, take the most recently updated model:
+    # 没有depth信息则直接用最晚生成的模型
     model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
     return model_tags[0]
 
 
 def find_last_step(checkpoint_dir):
+    # 搜索step最大的checkpoint，即最新的训练模型
     # Look into checkpoint_dir and find model_<step>.pt with the highest step
     checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "model_*.pt"))
     if not checkpoint_files:
